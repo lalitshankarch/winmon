@@ -2,18 +2,19 @@
     debug_assertions,
     allow(dead_code, unused_imports, unused_assignments, unused_variables)
 )]
+use std::collections::HashMap;
 use std::mem;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, HMODULE, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_FileDescription, PKEY_Software_ProductName};
-use windows::Win32::System::Com::{CoInitialize, CoUninitialize, CreateBindCtx, IBindCtx};
+use windows::Win32::System::Com::{CoInitialize, CoUninitialize, CreateBindCtx};
 use windows::Win32::System::ProcessStatus::{
     EnumProcessModules, EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW,
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use windows::Win32::UI::Shell::*;
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 
 type DWORD = u32;
 
@@ -30,15 +31,11 @@ fn cleanup() {
 }
 
 fn get_pids(proc_pids: &mut Vec<DWORD>) {
-    if proc_pids.is_empty() {
-        return;
-    }
-
     let dword_size = mem::size_of::<DWORD>();
 
     loop {
         let proc_pids_nbytes = proc_pids.len() * dword_size;
-        let mut needed_size: u32 = 0;
+        let mut needed_size = 0;
 
         unsafe {
             EnumProcesses(&mut proc_pids[0], proc_pids_nbytes as u32, &mut needed_size).unwrap();
@@ -54,6 +51,11 @@ fn get_pids(proc_pids: &mut Vec<DWORD>) {
     }
 }
 
+struct ProcessDesc {
+    display_name: String,
+    file_path: String,
+}
+
 struct ProcessInfo {
     exe_name: String,
     display_name: String,
@@ -63,13 +65,37 @@ struct ProcessInfo {
     private_working_set: usize,
 }
 
-fn get_process_info(pid: DWORD) -> Result<ProcessInfo, String> {
+fn get_process_desc(proc_handle: HANDLE, h_module: HMODULE) -> Result<ProcessDesc, String> {
+    unsafe {
+        let mut file_path_u16 = vec![0u16; 32767];
+        let len = GetModuleFileNameExW(Some(proc_handle), Some(h_module), &mut file_path_u16);
+
+        let bind_ctx = CreateBindCtx(0).map_err(|err| err.message())?;
+        let item: IShellItem2 =
+            SHCreateItemFromParsingName(PCWSTR(file_path_u16.as_ptr()), &bind_ctx)
+                .map_err(|err| err.message())?;
+        let display_name = item
+            .GetString(&PKEY_FileDescription)
+            .or_else(|_| item.GetString(&PKEY_Software_ProductName))
+            .map_err(|err| err.message())?;
+
+        Ok(ProcessDesc {
+            file_path: String::from_utf16(&file_path_u16[..len as usize]).unwrap(),
+            display_name: String::from_utf16(display_name.as_wide()).unwrap(),
+        })
+    }
+}
+
+fn get_process_info(
+    pid: DWORD,
+    pid_descs: &mut HashMap<String, ProcessDesc>,
+) -> Result<ProcessInfo, String> {
     unsafe {
         let proc_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
             .map_err(|err| err.message())?;
 
-        let mut h_module: HMODULE = Default::default();
-        let mut cb_needed: DWORD = Default::default();
+        let mut h_module = HMODULE::default();
+        let mut cb_needed = DWORD::default();
         EnumProcessModules(
             proc_handle,
             &mut h_module,
@@ -78,32 +104,20 @@ fn get_process_info(pid: DWORD) -> Result<ProcessInfo, String> {
         )
         .map_err(|err| err.message())?;
 
-        let mut process_name = vec![0; MAX_PATH as usize];
-        _ = GetModuleBaseNameW(proc_handle, Some(h_module), &mut process_name);
-        let proc_ex_name = String::from_utf16(&process_name).map_err(|err| err.to_string())?;
+        let mut proc_name = vec![0; MAX_PATH as usize];
+        let len = GetModuleBaseNameW(proc_handle, Some(h_module), &mut proc_name) as usize;
+        let exe_name = String::from_utf16(&proc_name[..len]).unwrap();
 
-        let mut file_path = vec![0; 32767 as usize];
-        _ = GetModuleFileNameExW(Some(proc_handle), Some(h_module), &mut file_path);
-        let proc_file_path = String::from_utf16(&file_path).map_err(|err| err.to_string())?;
+        let proc_desc = match pid_descs.get(&exe_name) {
+            Some(desc) => desc,
+            None => {
+                let proc_desc = get_process_desc(proc_handle, h_module)?;
+                pid_descs.insert(exe_name.clone(), proc_desc);
+                pid_descs.get(&exe_name).unwrap()
+            }
+        };
 
-        let file_path_wstr = PCWSTR(&file_path[0]);
-        let bind_ctx = CreateBindCtx(0).map_err(|err| err.to_string())?;
-        // IBindCtx make this option type
-        let result = SHCreateItemFromParsingName::<PCWSTR, &IBindCtx, IShellItem2>(
-            file_path_wstr,
-            &bind_ctx,
-        )
-        .map_err(|err| err.to_string())?;
-
-        let display_name_wstr = result.GetString(&PKEY_FileDescription).unwrap_or(
-            result
-                .GetString(&PKEY_Software_ProductName)
-                .unwrap_or(PWSTR(&mut process_name[0])),
-        );
-        let display_name =
-            String::from_utf16(display_name_wstr.as_wide()).map_err(|err| err.to_string())?;
-
-        let mut pmc: PROCESS_MEMORY_COUNTERS = Default::default();
+        let mut pmc = PROCESS_MEMORY_COUNTERS::default();
         GetProcessMemoryInfo(
             proc_handle,
             &mut pmc,
@@ -112,22 +126,20 @@ fn get_process_info(pid: DWORD) -> Result<ProcessInfo, String> {
         .map_err(|err| err.message())?;
         let pmc_ex2 = &mut pmc as *mut _ as *mut PROCESS_MEMORY_COUNTERS_EX2;
 
-        let proc_info: ProcessInfo = ProcessInfo {
-            exe_name: proc_ex_name,
-            display_name: display_name,
-            file_path: proc_file_path,
+        CloseHandle(proc_handle).map_err(|err| err.message())?;
+
+        Ok(ProcessInfo {
+            exe_name,
+            display_name: proc_desc.display_name.clone(),
+            file_path: proc_desc.file_path.clone(),
             working_set: pmc.WorkingSetSize,
             page_file: pmc.PagefileUsage,
             private_working_set: (*pmc_ex2).PrivateWorkingSetSize,
-        };
-
-        CloseHandle(proc_handle).map_err(|err| err.message())?;
-
-        Ok(proc_info)
+        })
     }
 }
 
-fn print_process_list() {
+fn print_process_list(pid_descs: &mut HashMap<String, ProcessDesc>) {
     let mut pids = vec![0; 1024];
     get_pids(&mut pids);
     println!(
@@ -135,24 +147,27 @@ fn print_process_list() {
         "PID", "Exectable name", "Working set", "Page file", "Private working set"
     );
     for pid in pids {
-        match get_process_info(pid) {
-            Ok(proc_info) => println!(
-                "{:>8}  {:<40}  {:<16}  {:<16}  {:<16}",
-                pid,
-                proc_info.display_name,
-                (proc_info.working_set / 1024),
-                (proc_info.page_file / 1024),
-                (proc_info.private_working_set / 1024),
-            ),
+        let proc_info = match get_process_info(pid, pid_descs) {
+            Ok(stats) => stats,
             Err(_) => continue,
-        }
+        };
+
+        println!(
+            "{:>8}  {:<40}  {:<16}  {:<16}  {:<16}",
+            pid,
+            proc_info.display_name,
+            (proc_info.working_set / 1024),
+            (proc_info.page_file / 1024),
+            (proc_info.private_working_set / 1024),
+        );
     }
 }
 
 fn main() {
     init();
     let start = Instant::now();
-    print_process_list();
+    let mut pid_descs = HashMap::<String, ProcessDesc>::new();
+    print_process_list(&mut pid_descs);
     println!("Elapsed: {:?}", start.elapsed());
     cleanup();
 }
