@@ -3,6 +3,7 @@
     allow(dead_code, unused_imports, unused_assignments, unused_variables)
 )]
 use std::collections::HashMap;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::mem;
 use std::time::Instant;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
@@ -12,7 +13,9 @@ use windows::Win32::System::ProcessStatus::{
     EnumProcessModules, EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW,
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
@@ -24,8 +27,11 @@ fn init() {
     }
 }
 
-fn cleanup() {
+fn cleanup(pid_to_handle: &HashMap<DWORD, HANDLE>) {
     unsafe {
+        for (key, value) in pid_to_handle.into_iter() {
+            CloseHandle(*value).unwrap();
+        }
         CoUninitialize();
     }
 }
@@ -51,24 +57,58 @@ fn get_pids(proc_pids: &mut Vec<DWORD>) {
     }
 }
 
+struct ProcCaches {
+    pid_to_handle: HashMap<DWORD, HANDLE>,
+    pid_to_path: HashMap<DWORD, String>,
+    path_to_desc: HashMap<String, ProcessDesc>,
+}
+
 struct ProcessDesc {
+    exe_name: String,
     display_name: String,
-    file_path: String,
 }
 
 struct ProcessInfo {
+    file_path: String,
     exe_name: String,
     display_name: String,
-    file_path: String,
     working_set: usize,
     page_file: usize,
     private_working_set: usize,
 }
 
-fn get_process_desc(proc_handle: HANDLE, h_module: HMODULE) -> Result<ProcessDesc, String> {
+fn enum_proc_modules(proc_handle: HANDLE, h_module: &mut HMODULE) -> Result<(), String> {
+    let mut h_module = HMODULE::default();
+    let mut cb_needed = DWORD::default();
     unsafe {
-        let mut file_path_u16 = vec![0u16; 32767];
-        let len = GetModuleFileNameExW(Some(proc_handle), Some(h_module), &mut file_path_u16);
+        EnumProcessModules(
+            proc_handle,
+            &mut h_module,
+            mem::size_of::<HMODULE>() as u32,
+            &mut cb_needed,
+        )
+        .map_err(|err| err.message())?;
+        Ok(())
+    }
+}
+
+fn get_file_path_u16(proc_handle: HANDLE, h_module: HMODULE) -> ([u16; 32767], usize) {
+    unsafe {
+        let mut file_path_u16 = [0; 32767 as usize];
+        let len =
+            GetModuleFileNameExW(Some(proc_handle), Some(h_module), &mut file_path_u16) as usize;
+        (file_path_u16, len)
+    }
+}
+
+fn get_process_desc(
+    proc_handle: HANDLE,
+    h_module: HMODULE,
+    file_path_u16: &[u16],
+) -> Result<ProcessDesc, String> {
+    unsafe {
+        let mut exe_name_u16 = [0; MAX_PATH as usize];
+        let len = GetModuleBaseNameW(proc_handle, Some(h_module), &mut exe_name_u16);
 
         let bind_ctx = CreateBindCtx(0).map_err(|err| err.message())?;
         let item: IShellItem2 =
@@ -80,40 +120,50 @@ fn get_process_desc(proc_handle: HANDLE, h_module: HMODULE) -> Result<ProcessDes
             .map_err(|err| err.message())?;
 
         Ok(ProcessDesc {
-            file_path: String::from_utf16(&file_path_u16[..len as usize]).unwrap(),
-            display_name: String::from_utf16(display_name.as_wide()).unwrap(),
+            exe_name: String::from_utf16_lossy(&exe_name_u16[..len as usize]),
+            display_name: String::from_utf16_lossy(display_name.as_wide()),
         })
     }
 }
 
-fn get_process_info(
-    pid: DWORD,
-    pid_descs: &mut HashMap<String, ProcessDesc>,
-) -> Result<ProcessInfo, String> {
+fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, String> {
     unsafe {
-        let proc_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
-            .map_err(|err| err.message())?;
+        let proc_handle = match caches.pid_to_handle.entry(pid) {
+            Occupied(entry) => entry.get().clone(),
+            Vacant(entry) => {
+                let proc_handle =
+                    OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+                        .map_err(|err| err.message())?;
+                entry.insert(proc_handle.clone());
+                proc_handle
+            }
+        };
 
-        let mut h_module = HMODULE::default();
-        let mut cb_needed = DWORD::default();
-        EnumProcessModules(
-            proc_handle,
-            &mut h_module,
-            mem::size_of::<HMODULE>() as u32,
-            &mut cb_needed,
-        )
-        .map_err(|err| err.message())?;
+        let file_path = match caches.pid_to_path.entry(pid) {
+            Occupied(entry) => entry.get().clone(),
+            Vacant(entry) => {
+                let mut h_module = HMODULE::default();
+                enum_proc_modules(proc_handle, &mut h_module)?;
 
-        let mut proc_name = vec![0; MAX_PATH as usize];
-        let len = GetModuleBaseNameW(proc_handle, Some(h_module), &mut proc_name) as usize;
-        let exe_name = String::from_utf16(&proc_name[..len]).unwrap();
+                let (file_path_u16, len) = get_file_path_u16(proc_handle, h_module);
+                let file_path = String::from_utf16_lossy(&file_path_u16[..len]);
+                entry.insert(file_path.clone());
+                file_path
+            }
+        };
 
-        let proc_desc = match pid_descs.get(&exe_name) {
-            Some(desc) => desc,
-            None => {
-                let proc_desc = get_process_desc(proc_handle, h_module)?;
-                pid_descs.insert(exe_name.clone(), proc_desc);
-                pid_descs.get(&exe_name).unwrap()
+        let proc_desc = match caches.path_to_desc.entry(file_path.clone()) {
+            Occupied(entry) => entry.into_mut(),
+            Vacant(entry) => {
+                let mut h_module = HMODULE::default();
+                enum_proc_modules(proc_handle, &mut h_module)?;
+
+                let (file_path_u16, len) = get_file_path_u16(proc_handle, h_module);
+                entry.insert(get_process_desc(
+                    proc_handle,
+                    h_module,
+                    &file_path_u16[..len],
+                )?)
             }
         };
 
@@ -126,12 +176,10 @@ fn get_process_info(
         .map_err(|err| err.message())?;
         let pmc_ex2 = &mut pmc as *mut _ as *mut PROCESS_MEMORY_COUNTERS_EX2;
 
-        CloseHandle(proc_handle).map_err(|err| err.message())?;
-
         Ok(ProcessInfo {
-            exe_name,
+            exe_name: proc_desc.exe_name.clone(),
             display_name: proc_desc.display_name.clone(),
-            file_path: proc_desc.file_path.clone(),
+            file_path,
             working_set: pmc.WorkingSetSize,
             page_file: pmc.PagefileUsage,
             private_working_set: (*pmc_ex2).PrivateWorkingSetSize,
@@ -139,7 +187,7 @@ fn get_process_info(
     }
 }
 
-fn print_process_list(pid_descs: &mut HashMap<String, ProcessDesc>) {
+fn print_process_list(caches: &mut ProcCaches) {
     let mut pids = vec![0; 1024];
     get_pids(&mut pids);
     println!(
@@ -147,7 +195,7 @@ fn print_process_list(pid_descs: &mut HashMap<String, ProcessDesc>) {
         "PID", "Exectable name", "Working set", "Page file", "Private working set"
     );
     for pid in pids {
-        let proc_info = match get_process_info(pid, pid_descs) {
+        let proc_info = match get_process_info(pid, caches) {
             Ok(stats) => stats,
             Err(_) => continue,
         };
@@ -166,8 +214,12 @@ fn print_process_list(pid_descs: &mut HashMap<String, ProcessDesc>) {
 fn main() {
     init();
     let start = Instant::now();
-    let mut pid_descs = HashMap::<String, ProcessDesc>::new();
-    print_process_list(&mut pid_descs);
+    let mut caches = ProcCaches {
+        pid_to_handle: HashMap::new(),
+        pid_to_path: HashMap::new(),
+        path_to_desc: HashMap::new(),
+    };
+    print_process_list(&mut caches);
     println!("Elapsed: {:?}", start.elapsed());
-    cleanup();
+    cleanup(&caches.pid_to_handle);
 }
