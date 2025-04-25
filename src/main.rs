@@ -6,16 +6,14 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::mem;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_FileDescription, PKEY_Software_ProductName};
 use windows::Win32::System::Com::{CoInitialize, CoUninitialize, CreateBindCtx};
 use windows::Win32::System::ProcessStatus::{
-    EnumProcessModules, EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW,
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW, GetProcessMemoryInfo,
+    PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
 };
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
@@ -29,7 +27,7 @@ fn init() {
 
 fn cleanup(pid_to_handle: &HashMap<DWORD, HANDLE>) {
     unsafe {
-        for (key, value) in pid_to_handle.into_iter() {
+        for (_, value) in pid_to_handle.into_iter() {
             CloseHandle(*value).unwrap();
         }
         CoUninitialize();
@@ -77,38 +75,18 @@ struct ProcessInfo {
     private_working_set: usize,
 }
 
-fn enum_proc_modules(proc_handle: HANDLE, h_module: &mut HMODULE) -> Result<(), String> {
-    let mut h_module = HMODULE::default();
-    let mut cb_needed = DWORD::default();
-    unsafe {
-        EnumProcessModules(
-            proc_handle,
-            &mut h_module,
-            mem::size_of::<HMODULE>() as u32,
-            &mut cb_needed,
-        )
-        .map_err(|err| err.message())?;
-        Ok(())
-    }
-}
-
-fn get_file_path_u16(proc_handle: HANDLE, h_module: HMODULE) -> ([u16; 32767], usize) {
+fn get_file_path_u16(proc_handle: HANDLE) -> ([u16; 32767], usize) {
     unsafe {
         let mut file_path_u16 = [0; 32767 as usize];
-        let len =
-            GetModuleFileNameExW(Some(proc_handle), Some(h_module), &mut file_path_u16) as usize;
+        let len = GetModuleFileNameExW(Some(proc_handle), None, &mut file_path_u16) as usize;
         (file_path_u16, len)
     }
 }
 
-fn get_process_desc(
-    proc_handle: HANDLE,
-    h_module: HMODULE,
-    file_path_u16: &[u16],
-) -> Result<ProcessDesc, String> {
+fn get_process_desc(proc_handle: HANDLE, file_path_u16: &[u16]) -> Result<ProcessDesc, String> {
     unsafe {
         let mut exe_name_u16 = [0; MAX_PATH as usize];
-        let len = GetModuleBaseNameW(proc_handle, Some(h_module), &mut exe_name_u16);
+        let len = GetModuleBaseNameW(proc_handle, None, &mut exe_name_u16);
 
         let bind_ctx = CreateBindCtx(0).map_err(|err| err.message())?;
         let item: IShellItem2 =
@@ -129,47 +107,35 @@ fn get_process_desc(
 fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, String> {
     unsafe {
         let proc_handle = match caches.pid_to_handle.entry(pid) {
-            Occupied(entry) => entry.get().clone(),
+            Occupied(entry) => entry.into_mut(),
             Vacant(entry) => {
                 let proc_handle =
                     OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
                         .map_err(|err| err.message())?;
-                entry.insert(proc_handle.clone());
-                proc_handle
+                entry.insert(proc_handle.clone())
             }
         };
 
         let file_path = match caches.pid_to_path.entry(pid) {
-            Occupied(entry) => entry.get().clone(),
+            Occupied(entry) => entry.into_mut(),
             Vacant(entry) => {
-                let mut h_module = HMODULE::default();
-                enum_proc_modules(proc_handle, &mut h_module)?;
-
-                let (file_path_u16, len) = get_file_path_u16(proc_handle, h_module);
+                let (file_path_u16, len) = get_file_path_u16(*proc_handle);
                 let file_path = String::from_utf16_lossy(&file_path_u16[..len]);
-                entry.insert(file_path.clone());
-                file_path
+                entry.insert(file_path.clone())
             }
         };
 
         let proc_desc = match caches.path_to_desc.entry(file_path.clone()) {
             Occupied(entry) => entry.into_mut(),
             Vacant(entry) => {
-                let mut h_module = HMODULE::default();
-                enum_proc_modules(proc_handle, &mut h_module)?;
-
-                let (file_path_u16, len) = get_file_path_u16(proc_handle, h_module);
-                entry.insert(get_process_desc(
-                    proc_handle,
-                    h_module,
-                    &file_path_u16[..len],
-                )?)
+                let (file_path_u16, len) = get_file_path_u16(*proc_handle);
+                entry.insert(get_process_desc(*proc_handle, &file_path_u16[..len])?)
             }
         };
 
         let mut pmc = PROCESS_MEMORY_COUNTERS::default();
         GetProcessMemoryInfo(
-            proc_handle,
+            *proc_handle,
             &mut pmc,
             mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
         )
@@ -179,7 +145,7 @@ fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, 
         Ok(ProcessInfo {
             exe_name: proc_desc.exe_name.clone(),
             display_name: proc_desc.display_name.clone(),
-            file_path,
+            file_path: file_path.clone(),
             working_set: pmc.WorkingSetSize,
             page_file: pmc.PagefileUsage,
             private_working_set: (*pmc_ex2).PrivateWorkingSetSize,
