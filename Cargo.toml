@@ -11,4 +11,5 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_UI_Shell_Common",
+    "Win32_System_Time",
 ]

@@ -6,18 +6,21 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::mem;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, SYSTEMTIME};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_FileDescription, PKEY_Software_ProductName};
 use windows::Win32::System::Com::{CoInitialize, CoUninitialize, CreateBindCtx};
 use windows::Win32::System::ProcessStatus::{
-    EnumProcesses, GetModuleBaseNameW, GetModuleFileNameExW, GetProcessMemoryInfo,
-    PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    EnumProcesses, GetModuleFileNameExW, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    PROCESS_MEMORY_COUNTERS_EX2,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    GetProcessHandleCount, GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
+use windows::Win32::System::Time::FileTimeToSystemTime;
 use windows::Win32::UI::Shell::*;
 use windows::core::PCWSTR;
 
-type DWORD = u32;
+type Dword = u32;
 
 fn init() {
     unsafe {
@@ -25,17 +28,17 @@ fn init() {
     }
 }
 
-fn cleanup(pid_to_handle: &HashMap<DWORD, HANDLE>) {
+fn cleanup(pid_to_handle: &HashMap<Dword, HANDLE>) {
     unsafe {
-        for (_, value) in pid_to_handle.into_iter() {
+        for (_, value) in pid_to_handle.iter() {
             CloseHandle(*value).unwrap();
         }
         CoUninitialize();
     }
 }
 
-fn get_pids(proc_pids: &mut Vec<DWORD>) {
-    let dword_size = mem::size_of::<DWORD>();
+fn get_pids(proc_pids: &mut Vec<Dword>) {
+    let dword_size = mem::size_of::<Dword>();
 
     loop {
         let proc_pids_nbytes = proc_pids.len() * dword_size;
@@ -56,38 +59,21 @@ fn get_pids(proc_pids: &mut Vec<DWORD>) {
 }
 
 struct ProcCaches {
-    pid_to_handle: HashMap<DWORD, HANDLE>,
-    pid_to_path: HashMap<DWORD, String>,
-    path_to_desc: HashMap<String, ProcessDesc>,
-}
-
-struct ProcessDesc {
-    exe_name: String,
-    display_name: String,
-}
-
-struct ProcessInfo {
-    file_path: String,
-    exe_name: String,
-    display_name: String,
-    working_set: usize,
-    page_file: usize,
-    private_working_set: usize,
+    pid_to_handle: HashMap<Dword, HANDLE>,
+    pid_to_path: HashMap<Dword, String>,
+    path_to_disp_name: HashMap<String, String>,
 }
 
 fn get_file_path_u16(proc_handle: HANDLE) -> ([u16; 32767], usize) {
     unsafe {
-        let mut file_path_u16 = [0; 32767 as usize];
+        let mut file_path_u16 = [0; 32767_usize];
         let len = GetModuleFileNameExW(Some(proc_handle), None, &mut file_path_u16) as usize;
         (file_path_u16, len)
     }
 }
 
-fn get_process_desc(proc_handle: HANDLE, file_path_u16: &[u16]) -> Result<ProcessDesc, String> {
+fn get_proc_disp_name(file_path_u16: &[u16]) -> Result<String, String> {
     unsafe {
-        let mut exe_name_u16 = [0; MAX_PATH as usize];
-        let len = GetModuleBaseNameW(proc_handle, None, &mut exe_name_u16);
-
         let bind_ctx = CreateBindCtx(0).map_err(|err| err.message())?;
         let item: IShellItem2 =
             SHCreateItemFromParsingName(PCWSTR(file_path_u16.as_ptr()), &bind_ctx)
@@ -97,14 +83,11 @@ fn get_process_desc(proc_handle: HANDLE, file_path_u16: &[u16]) -> Result<Proces
             .or_else(|_| item.GetString(&PKEY_Software_ProductName))
             .map_err(|err| err.message())?;
 
-        Ok(ProcessDesc {
-            exe_name: String::from_utf16_lossy(&exe_name_u16[..len as usize]),
-            display_name: String::from_utf16_lossy(display_name.as_wide()),
-        })
+        Ok(String::from_utf16_lossy(display_name.as_wide()))
     }
 }
 
-fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, String> {
+fn print_process_info(pid: Dword, caches: &mut ProcCaches) -> Result<(), String> {
     unsafe {
         let proc_handle = match caches.pid_to_handle.entry(pid) {
             Occupied(entry) => entry.into_mut(),
@@ -112,7 +95,7 @@ fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, 
                 let proc_handle =
                     OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
                         .map_err(|err| err.message())?;
-                entry.insert(proc_handle.clone())
+                entry.insert(proc_handle)
             }
         };
 
@@ -125,11 +108,11 @@ fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, 
             }
         };
 
-        let proc_desc = match caches.path_to_desc.entry(file_path.clone()) {
+        let proc_disp_name = match caches.path_to_disp_name.entry(file_path.clone()) {
             Occupied(entry) => entry.into_mut(),
             Vacant(entry) => {
                 let (file_path_u16, len) = get_file_path_u16(*proc_handle);
-                entry.insert(get_process_desc(*proc_handle, &file_path_u16[..len])?)
+                entry.insert(get_proc_disp_name(&file_path_u16[..len])?)
             }
         };
 
@@ -142,14 +125,50 @@ fn get_process_info(pid: DWORD, caches: &mut ProcCaches) -> Result<ProcessInfo, 
         .map_err(|err| err.message())?;
         let pmc_ex2 = &mut pmc as *mut _ as *mut PROCESS_MEMORY_COUNTERS_EX2;
 
-        Ok(ProcessInfo {
-            exe_name: proc_desc.exe_name.clone(),
-            display_name: proc_desc.display_name.clone(),
-            file_path: file_path.clone(),
-            working_set: pmc.WorkingSetSize,
-            page_file: pmc.PagefileUsage,
-            private_working_set: (*pmc_ex2).PrivateWorkingSetSize,
-        })
+        let (mut creation_time_ft, mut exit_time_ft, mut kernel_time_ft, mut user_time_ft) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        GetProcessTimes(
+            *proc_handle,
+            &mut creation_time_ft,
+            &mut exit_time_ft,
+            &mut kernel_time_ft,
+            &mut user_time_ft,
+        )
+        .map_err(|err| err.message())?;
+
+        let (mut kernel_time, mut user_time) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+        FileTimeToSystemTime(&kernel_time_ft, &mut kernel_time).map_err(|err| err.message())?;
+        FileTimeToSystemTime(&user_time_ft, &mut user_time).map_err(|err| err.message())?;
+
+        let mut hnd_count = 0;
+        GetProcessHandleCount(*proc_handle, &mut hnd_count).map_err(|err| err.message())?;
+
+        println!(
+            "{:>6} {:<40} {:<6} {:<10} {:<10} {:<10} {:<14} {:<14}",
+            pid,
+            proc_disp_name,
+            hnd_count,
+            (pmc.WorkingSetSize / 1024),
+            (pmc.PagefileUsage / 1024),
+            ((*pmc_ex2).PrivateWorkingSetSize / 1024),
+            format!(
+                "{}:{}:{}:{}",
+                kernel_time.wHour,
+                kernel_time.wMinute,
+                kernel_time.wSecond,
+                kernel_time.wMilliseconds
+            ),
+            format!(
+                "{}:{}:{}:{}",
+                user_time.wHour, user_time.wMinute, user_time.wSecond, kernel_time.wMilliseconds
+            )
+        );
+
+        Ok(())
     }
 }
 
@@ -157,23 +176,11 @@ fn print_process_list(caches: &mut ProcCaches) {
     let mut pids = vec![0; 1024];
     get_pids(&mut pids);
     println!(
-        "{:>8}  {:<40}  {:<16}  {:<16}  {:<16}",
-        "PID", "Exectable name", "Working set", "Page file", "Private working set"
+        "\n{:>6} {:<40} {:<6} {:<10} {:<10} {:<10} {:<14} {:<14}",
+        "PID", "Program", "Hnd.", "WS", "Pagefile", "Priv. WS", "Kernel time", "User time"
     );
     for pid in pids {
-        let proc_info = match get_process_info(pid, caches) {
-            Ok(stats) => stats,
-            Err(_) => continue,
-        };
-
-        println!(
-            "{:>8}  {:<40}  {:<16}  {:<16}  {:<16}",
-            pid,
-            proc_info.display_name,
-            (proc_info.working_set / 1024),
-            (proc_info.page_file / 1024),
-            (proc_info.private_working_set / 1024),
-        );
+        _ = print_process_info(pid, caches);
     }
 }
 
@@ -183,7 +190,7 @@ fn main() {
     let mut caches = ProcCaches {
         pid_to_handle: HashMap::new(),
         pid_to_path: HashMap::new(),
-        path_to_desc: HashMap::new(),
+        path_to_disp_name: HashMap::new(),
     };
     print_process_list(&mut caches);
     println!("Elapsed: {:?}", start.elapsed());
