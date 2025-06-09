@@ -164,7 +164,7 @@ fn print_process_info(pid: Dword, caches: &mut ProcCaches) -> Result<(), String>
             ),
             format!(
                 "{}:{}:{}:{}",
-                user_time.wHour, user_time.wMinute, user_time.wSecond, kernel_time.wMilliseconds
+                user_time.wHour, user_time.wMinute, user_time.wSecond, user_time.wMilliseconds
             )
         );
 
