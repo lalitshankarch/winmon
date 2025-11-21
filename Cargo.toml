@@ -13,3 +13,10 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_System_Time",
 ]
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
